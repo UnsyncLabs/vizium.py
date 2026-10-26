@@ -17,6 +17,12 @@ from .user import User
 from .utils import websocket_base
 
 
+
+# Reconnect backoff: while the server is down (e.g. during an update) wait longer between attempts
+# instead of hammering it every few seconds; back to the minimum as soon as a connection succeeds.
+RECONNECT_MIN_S = 3
+RECONNECT_MAX_S = 60
+
 class Bot(MessageHandler):
     """Async Vizium bot client authenticated by a generated bot token."""
 
@@ -249,6 +255,7 @@ class Bot(MessageHandler):
 
     async def _watch_direct_messages(self):
         reconnecting = False
+        delay = RECONNECT_MIN_S
         while self._running:
             try:
                 await self._get_new_session()
@@ -263,6 +270,7 @@ class Bot(MessageHandler):
                                 break
                             event = incoming.json()
                             if event.get("op") == "hello":
+                                delay = RECONNECT_MIN_S
                                 await self._sync_direct_messages()
                                 await self._call_event("dm_connect" if not reconnecting else "dm_reconnect")
                                 continue
@@ -279,10 +287,11 @@ class Bot(MessageHandler):
                 break
             except Exception as exc:
                 await self._call_event("error", None, exc)
-                logging.getLogger(__name__).warning("Direct-message socket disconnected: %s", exc)
+                logging.getLogger(__name__).warning("Direct-message socket disconnected: %s (retry in %ss)", exc, delay)
             if self._running:
                 reconnecting = True
-                await asyncio.sleep(3)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RECONNECT_MAX_S)
 
     async def send_message(self, guild_id: str, channel_id: str, content: str = "", *, embed=None):
         """Send through the REST API; works before a WebSocket is connected."""
@@ -387,6 +396,7 @@ class Bot(MessageHandler):
 
     async def _watch_channel(self, channel: Channel):
         reconnecting = False
+        delay = RECONNECT_MIN_S
         while self._running:
             try:
                 # A bot access JWT is deliberately short-lived. Re-exchange the
@@ -409,16 +419,18 @@ class Bot(MessageHandler):
                             await self._handle_ws_event(channel, incoming.json())
                             if not channel.connected:
                                 channel._connected = True
+                                delay = RECONNECT_MIN_S
                                 await self._call_event("reconnect" if reconnecting else "connect", channel)
                         channel._connected = False
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 await self._call_event("error", channel, exc)
-                logging.getLogger(__name__).warning("Channel %s disconnected: %s", channel.name, exc)
+                logging.getLogger(__name__).warning("Channel %s disconnected: %s (retry in %ss)", channel.name, exc, delay)
             if self._running:
                 reconnecting = True
-                await asyncio.sleep(3)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RECONNECT_MAX_S)
         channel._connected = False
         await self._call_event("disconnect", channel)
 
