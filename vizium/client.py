@@ -40,6 +40,7 @@ class Bot(MessageHandler):
         self._guilds: dict[str, Guild] = {}
         # guild_id → domain of the self-hosted instance that serves it
         self._instances: dict[str, str] = {}
+        self._voice: dict[str, str] = {}   # guild_id → voice channel the bot is signalled in
         self._tasks: list[asyncio.Task] = []
         self._running = False
         self._guild_sync_interval = 15.0
@@ -401,6 +402,48 @@ class Bot(MessageHandler):
                 link = (await response.json())["url"]
         return link if link.startswith("http") else f"{base}{link}"
 
+    # ── voice ────────────────────────────────────────────────────────
+    async def voice_channels(self, guild_id: str) -> list[dict]:
+        """The guild's voice channels (`channel_id`, `name`, …)."""
+        guild = self._guilds.get(str(guild_id)) or Guild(str(guild_id), self)
+        return [c for c in await guild.channels() if c.get("channel_type") == "voice"]
+
+    async def voice_states(self, channel_id: str, guild_id: str) -> list[dict]:
+        """Who is signalled in a voice channel right now (`user_id`, `self_mute`, …)."""
+        return await self._api_request("GET", f"/api/v1/chat/channels/{channel_id}/voice-states",
+                                       guild_id=guild_id) or []
+
+    async def voice_token(self, channel_id: str, guild_id: str) -> dict:
+        """A short-lived LiveKit token for the voice channel: `{url, token, room, expires_at, can_publish}`. The
+        server checks that the bot may access the channel."""
+        return await self._api_request("POST", f"/api/v1/chat/channels/{channel_id}/voice-token", {},
+                                       guild_id=guild_id)
+
+    async def voice_join(self, guild_id: str, channel_id: str):
+        """Signal presence in a voice channel (the list everyone sees). Media goes through LiveKit, separately.
+        Re-sent automatically when a guild socket reconnects (the server releases it when a socket drops)."""
+        self._voice[str(guild_id)] = str(channel_id)
+        await self._voice_signal(str(guild_id), "voice_join", str(channel_id))
+
+    async def voice_leave(self, guild_id: str):
+        channel_id = self._voice.pop(str(guild_id), None)
+        if channel_id:
+            await self._voice_signal(str(guild_id), "voice_leave", channel_id)
+
+    def voice_channel_of(self, guild_id: str) -> str | None:
+        """The voice channel the bot is in for this guild, if any."""
+        return self._voice.get(str(guild_id))
+
+    async def _voice_signal(self, guild_id: str, op: str, channel_id: str):
+        sent = False
+        for channel in list(self._channels.values()):
+            if channel.guild_id == guild_id and channel._ws is not None and not channel._ws.closed:
+                payload = {"op": op, "channel": channel_id, "data": {"self_mute": False, "self_deaf": False}}
+                await channel._ws.send_json(payload)
+                sent = True
+        if not sent and op == "voice_join":
+            raise InvalidChannel(f"No open socket for guild {guild_id}")
+
     def _channel_guild(self, channel_id: str) -> str | None:
         channel = self._channels.get(str(channel_id))
         return channel.guild_id if channel else None
@@ -456,6 +499,9 @@ class Bot(MessageHandler):
                         channel._ws = ws
                         await ws.send_json({"op": "auth", "token": self._access_token})
                         await ws.send_json({"op": "subscribe", "channel": channel.id})
+                        if voice := self._voice.get(channel.guild_id):   # the server dropped it with the old socket
+                            await ws.send_json({"op": "voice_join", "channel": voice,
+                                                "data": {"self_mute": False, "self_deaf": False}})
                         async for incoming in ws:
                             if incoming.type != aiohttp.WSMsgType.TEXT:
                                 break
