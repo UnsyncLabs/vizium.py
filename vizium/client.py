@@ -358,6 +358,26 @@ class Bot(MessageHandler):
         await self._api_request("PUT", f"/api/v1/chat/servers/{guild_id}/channels/reorder", {"channels": channels},
                                 guild_id=guild_id)
 
+    async def upload_file(self, filename: str, data: bytes, content_type: str = "application/octet-stream", *,
+                          guild_id: str | None = None) -> str:
+        """Upload a file to the Hub (or the guild's self-hosted instance) and return its absolute URL, ready to paste
+        into a message (that is how clients attach files: the URL goes in the content)."""
+        if not self._access_token:
+            await self._get_new_session()
+        base = self._api_base_for(guild_id)
+        form = aiohttp.FormData()
+        form.add_field("file", data, filename=filename, content_type=content_type)
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(f"{base}/api/v1/chat/upload", data=form) as response:
+                if response.status == 401:
+                    await self._get_new_session()
+                    return await self.upload_file(filename, data, content_type, guild_id=guild_id)
+                if response.status >= 400:
+                    raise RuntimeError(f"Vizium upload error {response.status}: {await response.text()}")
+                url = (await response.json())["url"]
+        return url if url.startswith("http") else f"{base}{url}"
+
     def _channel_guild(self, channel_id: str) -> str | None:
         channel = self._channels.get(str(channel_id))
         return channel.guild_id if channel else None
