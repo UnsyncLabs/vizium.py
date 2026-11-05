@@ -359,7 +359,7 @@ class Bot(MessageHandler):
                                 guild_id=guild_id)
 
     async def upload_file(self, filename: str, data: bytes, content_type: str = "application/octet-stream", *,
-                          guild_id: str | None = None) -> str:
+                          guild_id: str | None = None, _retry: bool = True) -> str:
         """Upload a file to the Hub (or the guild's self-hosted instance) and return its absolute URL, ready to paste
         into a message (that is how clients attach files: the URL goes in the content)."""
         if not self._access_token:
@@ -370,28 +370,32 @@ class Bot(MessageHandler):
         headers = {"Authorization": f"Bearer {self._access_token}"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.post(f"{base}/api/v1/chat/upload", data=form) as response:
-                if response.status == 401:
+                if response.status == 401 and _retry:
                     await self._get_new_session()
-                    return await self.upload_file(filename, data, content_type, guild_id=guild_id)
+                    return await self.upload_file(filename, data, content_type, guild_id=guild_id, _retry=False)
                 if response.status >= 400:
                     raise RuntimeError(f"Vizium upload error {response.status}: {await response.text()}")
                 url = (await response.json())["url"]
         return url if url.startswith("http") else f"{base}{url}"
 
-    async def file_link(self, url: str) -> str:
+    async def file_link(self, url: str, *, _retry: bool = True) -> str:
         """A short-lived signed link to open a private upload (`https://<host>/uploads/<name>`). Uploads are private
-        since Vizium 0.4.7: the bare URL answers 403. Asks the same host that serves the file."""
+        since Vizium 0.4.7: the bare URL answers 403. Asks the same host that serves the file, and only if that host
+        is the Hub or a known instance: the bot's token is never sent anywhere else."""
         from urllib.parse import quote, urlsplit
+        parts = urlsplit(url)
+        known = {urlsplit(self._api_base_url).hostname} | set(self._instances.values())
+        if parts.scheme != "https" or not parts.hostname or parts.hostname not in known or parts.port not in (None, 443):
+            raise ValueError("Not a Vizium upload URL")
         if not self._access_token:
             await self._get_new_session()
-        parts = urlsplit(url)
-        base = f"{parts.scheme}://{parts.netloc}"
+        base = f"https://{parts.hostname}"
         headers = {"Authorization": f"Bearer {self._access_token}"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(f"{base}/api/v1/chat/files/link?path={quote(parts.path)}") as response:
-                if response.status == 401:
+                if response.status == 401 and _retry:
                     await self._get_new_session()
-                    return await self.file_link(url)
+                    return await self.file_link(url, _retry=False)
                 if response.status >= 400:
                     raise RuntimeError(f"Vizium file link error {response.status}")
                 link = (await response.json())["url"]
