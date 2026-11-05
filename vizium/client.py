@@ -378,6 +378,25 @@ class Bot(MessageHandler):
                 url = (await response.json())["url"]
         return url if url.startswith("http") else f"{base}{url}"
 
+    async def file_link(self, url: str) -> str:
+        """A short-lived signed link to open a private upload (`https://<host>/uploads/<name>`). Uploads are private
+        since Vizium 0.4.7: the bare URL answers 403. Asks the same host that serves the file."""
+        from urllib.parse import quote, urlsplit
+        if not self._access_token:
+            await self._get_new_session()
+        parts = urlsplit(url)
+        base = f"{parts.scheme}://{parts.netloc}"
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(f"{base}/api/v1/chat/files/link?path={quote(parts.path)}") as response:
+                if response.status == 401:
+                    await self._get_new_session()
+                    return await self.file_link(url)
+                if response.status >= 400:
+                    raise RuntimeError(f"Vizium file link error {response.status}")
+                link = (await response.json())["url"]
+        return link if link.startswith("http") else f"{base}{link}"
+
     def _channel_guild(self, channel_id: str) -> str | None:
         channel = self._channels.get(str(channel_id))
         return channel.guild_id if channel else None
