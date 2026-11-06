@@ -22,6 +22,9 @@ from .utils import websocket_base
 # instead of hammering it every few seconds; back to the minimum as soon as a connection succeeds.
 RECONNECT_MIN_S = 3
 RECONNECT_MAX_S = 60
+# Messages fetched per channel after a reconnect, to catch up on what arrived
+# while the socket was down
+BACKFILL_LIMIT = 50
 
 class Bot(MessageHandler):
     """Async Vizium bot client authenticated by a generated bot token."""
@@ -42,6 +45,9 @@ class Bot(MessageHandler):
         self._instances: dict[str, str] = {}
         self._voice: dict[str, str] = {}   # guild_id → voice channel the bot is signalled in
         self._tasks: list[asyncio.Task] = []
+        # One socket per guild carries all of its subscribed channels
+        self._guild_ws: dict[str, aiohttp.ClientWebSocketResponse] = {}
+        self._guild_watchers: dict[str, asyncio.Task] = {}
         self._running = False
         self._guild_sync_interval = 15.0
         self._guilds_loaded = False
@@ -125,7 +131,10 @@ class Bot(MessageHandler):
             await channel.close()
         if self._global_ws and not self._global_ws.closed:
             await self._global_ws.close()
-        for task in self._tasks:
+        for ws in list(self._guild_ws.values()):
+            if not ws.closed:
+                await ws.close()
+        for task in [*self._tasks, *self._guild_watchers.values()]:
             if not task.done():
                 task.cancel()
         if self._message_task:
@@ -140,13 +149,36 @@ class Bot(MessageHandler):
             raise AlreadyConnected(f"Already connected to channel {channel_id}")
         channel = Channel(channel_id, self, str(target_guild))
         self._channels[channel_id] = channel
-        self.add_task(self._watch_channel(channel))
+        watcher = self._guild_watchers.get(channel.guild_id)
+        if watcher is None or watcher.done():
+            self._guild_watchers[channel.guild_id] = asyncio.create_task(self._watch_guild(channel.guild_id))
+        elif (ws := self._guild_ws.get(channel.guild_id)) is not None and not ws.closed:
+            # The guild's socket is already up: just add the channel to it
+            channel._ws = ws
+            self.add_task(self._subscribe(ws, channel))
         return channel
 
     def leave_channel(self, channel_id):
         channel = self._channels.pop(str(channel_id), None)
-        if channel:
-            self.add_task(channel.close())
+        if not channel:
+            return
+        channel._connected = False
+        ws = self._guild_ws.get(channel.guild_id)
+        if not any(c.guild_id == channel.guild_id for c in self._channels.values()):
+            # Last channel of the guild: drop its socket
+            watcher = self._guild_watchers.pop(channel.guild_id, None)
+            if watcher and not watcher.done():
+                watcher.cancel()
+        elif ws is not None and not ws.closed:
+            self.add_task(ws.send_json({"op": "unsubscribe", "channel": channel.id}))
+
+    async def _subscribe(self, ws, channel: Channel):
+        try:
+            await ws.send_json({"op": "subscribe", "channel": channel.id})
+            channel._connected = True
+            await self._call_event("connect", channel)
+        except Exception as exc:
+            await self._call_event("error", channel, exc)
 
     def get_channel(self, channel_id):
         return self._channels.get(str(channel_id))
@@ -435,13 +467,11 @@ class Bot(MessageHandler):
         return self._voice.get(str(guild_id))
 
     async def _voice_signal(self, guild_id: str, op: str, channel_id: str):
-        sent = False
-        for channel in list(self._channels.values()):
-            if channel.guild_id == guild_id and channel._ws is not None and not channel._ws.closed:
-                payload = {"op": op, "channel": channel_id, "data": {"self_mute": False, "self_deaf": False}}
-                await channel._ws.send_json(payload)
-                sent = True
-        if not sent and op == "voice_join":
+        ws = self._guild_ws.get(guild_id)
+        if ws is not None and not ws.closed:
+            await ws.send_json({"op": op, "channel": channel_id,
+                                "data": {"self_mute": False, "self_deaf": False}})
+        elif op == "voice_join":
             raise InvalidChannel(f"No open socket for guild {guild_id}")
 
     def _channel_guild(self, channel_id: str) -> str | None:
@@ -480,68 +510,138 @@ class Bot(MessageHandler):
             pass
         return self._api_base_url
 
-    async def _watch_channel(self, channel: Channel):
+    def _guild_channels(self, guild_id: str) -> list[Channel]:
+        return [c for c in self._channels.values() if c.guild_id == guild_id]
+
+    async def _watch_guild(self, guild_id: str):
+        """One socket for the whole guild: subscribes every joined channel,
+        catches up on missed messages after a reconnect and re-sends voice."""
+        log = logging.getLogger(__name__)
         reconnecting = False
         delay = RECONNECT_MIN_S
-        while self._running:
-            try:
-                # A bot access JWT is deliberately short-lived. Re-exchange the
-                # opaque token for every new WebSocket connection/reconnect.
-                await self._get_new_session()
-                instance = self._instances.get(channel.guild_id)
-                if instance:
-                    url = f"wss://{instance}/ws/{channel.guild_id}"
-                else:
-                    base = await self._resolve_websocket_base()
-                    url = f"{websocket_base(base)}/server/{channel.guild_id}/ws"
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(url, heartbeat=30) as ws:
-                        channel._ws = ws
-                        await ws.send_json({"op": "auth", "token": self._access_token})
-                        await ws.send_json({"op": "subscribe", "channel": channel.id})
-                        if voice := self._voice.get(channel.guild_id):   # the server dropped it with the old socket
-                            await ws.send_json({"op": "voice_join", "channel": voice,
-                                                "data": {"self_mute": False, "self_deaf": False}})
-                        async for incoming in ws:
-                            if incoming.type != aiohttp.WSMsgType.TEXT:
-                                break
-                            await self._handle_ws_event(channel, incoming.json())
-                            if not channel.connected:
+        try:
+            while self._running and self._guild_channels(guild_id):
+                try:
+                    # A bot access JWT is deliberately short-lived. Re-exchange the
+                    # opaque token for every new WebSocket connection/reconnect.
+                    await self._get_new_session()
+                    instance = self._instances.get(guild_id)
+                    if instance:
+                        url = f"wss://{instance}/ws/{guild_id}"
+                    else:
+                        base = await self._resolve_websocket_base()
+                        url = f"{websocket_base(base)}/server/{guild_id}/ws"
+                    async with aiohttp.ClientSession() as session:
+                        async with session.ws_connect(url, heartbeat=30) as ws:
+                            self._guild_ws[guild_id] = ws
+                            await ws.send_json({"op": "auth", "token": self._access_token})
+                            channels = self._guild_channels(guild_id)
+                            for channel in channels:
+                                channel._ws = ws
+                                await ws.send_json({"op": "subscribe", "channel": channel.id})
+                            if voice := self._voice.get(guild_id):   # the server dropped it with the old socket
+                                await ws.send_json({"op": "voice_join", "channel": voice,
+                                                    "data": {"self_mute": False, "self_deaf": False}})
+                            delay = RECONNECT_MIN_S
+                            for channel in channels:
                                 channel._connected = True
-                                delay = RECONNECT_MIN_S
                                 await self._call_event("reconnect" if reconnecting else "connect", channel)
+                            if reconnecting:
+                                self.add_task(self._backfill(channels))
+                            async for incoming in ws:
+                                if incoming.type != aiohttp.WSMsgType.TEXT:
+                                    break
+                                # Never await slow callbacks here: the socket only
+                                # answers the server's pings while it is being read
+                                await self._handle_ws_event(guild_id, incoming.json())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await self._call_event("error", None, exc)
+                    log.warning("Guild %s socket disconnected: %s (retry in %ss)", guild_id, exc, delay)
+                finally:
+                    if self._guild_ws.get(guild_id) is not None:
+                        self._guild_ws.pop(guild_id, None)
+                    for channel in self._guild_channels(guild_id):
                         channel._connected = False
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                await self._call_event("error", channel, exc)
-                logging.getLogger(__name__).warning("Channel %s disconnected: %s (retry in %ss)", channel.name, exc, delay)
-            if self._running:
-                reconnecting = True
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, RECONNECT_MAX_S)
-        channel._connected = False
-        await self._call_event("disconnect", channel)
+                if self._running and self._guild_channels(guild_id):
+                    reconnecting = True
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, RECONNECT_MAX_S)
+        except asyncio.CancelledError:
+            pass
+        for channel in self._guild_channels(guild_id):
+            await self._call_event("disconnect", channel)
 
-    async def _handle_ws_event(self, channel: Channel, event: dict):
+    def _message_from(self, channel: Channel, data: dict, raw: dict) -> Message:
+        return Message(
+            id=str(data.get("message_id", "")),
+            channel=channel,
+            user=User(id=str(data.get("author_id", ""))),
+            body=str(data.get("content", "")),
+            time=str(data.get("timestamp", "")),
+            raw=raw,
+        )
+
+    async def _deliver(self, message: Message):
+        """Queue a message once (live and catch-up may both carry it)."""
+        channel = message.channel
+        if not message.id or message.id in channel._messages:
+            return
+        channel._messages[message.id] = message
+        try:
+            channel._last_id = max(channel._last_id, int(message.id))
+        except ValueError:
+            pass
+        await self._add_message(message)
+
+    async def _backfill(self, channels: list[Channel]):
+        """Deliver the messages sent while the socket was down."""
+        for channel in channels:
+            if not channel._last_id:
+                continue   # nothing seen yet: no point replaying old history
+            try:
+                items = await self._api_request(
+                    "GET", f"/api/v1/chat/channels/{channel.id}/messages?limit={BACKFILL_LIMIT}",
+                    guild_id=channel.guild_id,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Catch-up of channel %s failed: %s", channel.id, exc)
+                continue
+            missed = []
+            for item in items or []:
+                try:
+                    if int(item.get("message_id", 0)) > channel._last_id:
+                        missed.append(item)
+                except (TypeError, ValueError):
+                    continue
+            for item in sorted(missed, key=lambda m: int(m["message_id"])):
+                await self._deliver(self._message_from(channel, item, {"op": "message", "data": item, "backfill": True}))
+
+    def _spawn_event(self, event: str, *args):
+        task = asyncio.create_task(self._call_event(event, *args))
+        task.add_done_callback(lambda t: t.cancelled() or not t.exception() or logging.getLogger(__name__)
+                               .error("Unhandled %s callback", event, exc_info=t.exception()))
+
+    async def _handle_ws_event(self, guild_id: str, event: dict):
         op = event.get("op")
         data = event.get("data") or {}
+        channel_id = str(event.get("channel") or data.get("channel_id") or "")
+        channel = self._channels.get(channel_id)
+        if channel is None or channel.guild_id != guild_id:
+            # Guild-wide events (voice, presence): hand them the guild's first channel
+            channel = next(iter(self._guild_channels(guild_id)), None)
+            if channel is None:
+                return
         if op == "message":
-            message = Message(
-                id=str(data.get("message_id", "")),
-                channel=channel,
-                user=User(id=str(data.get("author_id", ""))),
-                body=str(data.get("content", "")),
-                time=str(data.get("timestamp", "")),
-                raw=event,
-            )
-            channel._messages[message.id] = message
-            await self._add_message(message)
+            if channel.id != channel_id:
+                return
+            await self._deliver(self._message_from(channel, data, event))
         elif op == "typing":
-            await self._call_event("typing", channel, data)
+            self._spawn_event("typing", channel, data)
         elif op == "presence":
-            await self._call_event("presence", channel, data)
+            self._spawn_event("presence", channel, data)
         elif op == "voice_state_update":
-            await self._call_event("voice_state_update", channel, data)
+            self._spawn_event("voice_state_update", channel, data)
         elif op == "error":
-            await self._call_event("error", channel, RuntimeError(data.get("message", "Unknown WebSocket error")))
+            self._spawn_event("error", channel, RuntimeError(data.get("message", "Unknown WebSocket error")))

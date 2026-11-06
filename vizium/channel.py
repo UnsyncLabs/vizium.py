@@ -21,6 +21,7 @@ class Channel:
         self._ws = None
         self._connected = False
         self._messages = {}
+        self._last_id = 0   # newest message seen, for catching up after a reconnect
 
     @property
     def id(self) -> str:
@@ -85,8 +86,8 @@ class Channel:
         await self._ws.send_json(payload)
 
     async def close(self):
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
+        """Stop receiving this channel (the guild's socket stays up for the others)."""
+        self._client.leave_channel(self.id)
         self._connected = False
 
     async def delete_user(self, username: str):
